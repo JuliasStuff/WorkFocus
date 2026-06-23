@@ -90,6 +90,20 @@
   }
   .save-dot.saving{ background:var(--pop); animation:pulse 1s infinite; }
   .save-dot.error { background:var(--bad); }
+
+  /* Cloud sync indicator (Firebase) */
+  .sync-dot{
+    width:10px; height:10px; border-radius:50%;
+    background:#bbb; display:inline-block;
+    box-shadow:0 0 0 2px rgba(255,255,255,.6);
+    transition:background .25s;
+  }
+  .sync-dot.off       { background:#bbb; }
+  .sync-dot.connecting{ background:#c98a4b; animation:pulse 1.2s infinite; }
+  .sync-dot.connected { background:#4caf6a; }
+  .sync-dot.error     { background:#d94a4a; }
+  .save-pill-sep      { opacity:.5; margin:0 2px; }
+
   @keyframes pulse{
     0%,100%{ opacity:1; transform:scale(1); }
     50%    { opacity:.55; transform:scale(.85); }
@@ -605,6 +619,9 @@
       <p class="sub">Pick 1–3 things. Run the timer. Ship it. ⚡</p>
     </div>
     <div class="save-pill">
+      <span id="sync-status-dot" class="sync-dot off" aria-hidden="true" title="Cloud sync"></span>
+      <span id="sync-status">Sync: starting…</span>
+      <span class="save-pill-sep" aria-hidden="true">•</span>
       <span id="save-dot" class="save-dot" aria-hidden="true"></span>
       <span id="save-status">Saved</span>
     </div>
@@ -751,6 +768,9 @@
 </div>
 
 <script type="module">
+import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.5/firebase-app.js";
+import { getFirestore, doc, getDoc, setDoc, onSnapshot, serverTimestamp } from "https://www.gstatic.com/firebasejs/10.12.5/firebase-firestore.js";
+
 /* =========================================================
    WorkFocus — single-file PWA
    - localStorage data
@@ -761,6 +781,18 @@
 const STORAGE_KEY        = "workfocus-v1";
 const BACKUP_KEY         = "workfocus-v1-backup";       // last good snapshot, written before each save
 const CORRUPT_KEY_PREFIX = "workfocus-v1-corrupt-";      // suffixed with timestamp on rescue
+const CLIENT_ID_STORAGE_KEY = "workfocus-client-id";
+const FIREBASE_COLLECTION = "workfocus";
+const WORKFOCUS_DOC_ID    = "julia";
+const FIREBASE_CONFIG = {
+  apiKey: "AIzaSyDUqZ53nOjALi7wnzUo8hQBv9MNZh3_8jI",
+  authDomain: "fishlerhousehold.firebaseapp.com",
+  projectId: "fishlerhousehold",
+  storageBucket: "fishlerhousehold.firebasestorage.app",
+  messagingSenderId: "294840211894",
+  appId: "1:294840211894:web:0e951b834c2b2cf9a94917",
+  measurementId: "G-X0JYERSCGM"
+};
 const MAX_FOCUS = 3;
 
 // Filled in by load() when something had to be rescued so the UI can show a banner.
@@ -946,6 +978,20 @@ function save(){
     console.error("Save failed", e);
     setSaveError();
   }
+  // Push to cloud (if connected). Skip echoes from applying a remote snapshot.
+  if(!trackerRef || applyingRemote) return;
+  const payload = JSON.parse(JSON.stringify(data));
+  saveQueue = saveQueue
+    .then(()=>setDoc(trackerRef, {
+      payload,
+      updatedAt: serverTimestamp(),
+      updatedBy: clientId
+    }, { merge: true }))
+    .catch(err=>{
+      console.error("Save to Firebase failed:", err);
+      setSyncDot("error");
+      syncStatus("Sync: save failed (kept locally)");
+    });
 }
 function clone(o){ return JSON.parse(JSON.stringify(o)); }
 function uid(){ return Math.random().toString(36).slice(2,10); }
@@ -2111,10 +2157,128 @@ function renderAll(){
   renderAdmin();
 }
 
+/* =========================================================
+   Cloud Sync (Firebase Firestore)
+   Single doc per user. Realtime via onSnapshot.
+   Mirrors the pattern from the FishlerHousehold app.
+   ========================================================= */
+let firebaseApp = null;
+let firebaseDb  = null;
+let trackerRef  = null;
+let unsubscribeRemote = null;
+let saveQueue = Promise.resolve();
+let syncErrorShown = false;
+let applyingRemote = false;
+const clientId = getClientId();
+
+function getClientId(){
+  try{
+    let id = localStorage.getItem(CLIENT_ID_STORAGE_KEY);
+    if(id) return id;
+    id = (crypto.randomUUID ? crypto.randomUUID() : (Date.now().toString(36) + Math.random().toString(36).slice(2,10))).slice(0,36);
+    localStorage.setItem(CLIENT_ID_STORAGE_KEY, id);
+    return id;
+  }catch(_){
+    return "anon-" + Math.random().toString(36).slice(2,10);
+  }
+}
+
+function syncStatus(text){
+  const el = document.getElementById("sync-status");
+  if(el) el.textContent = text;
+}
+function setSyncDot(state){
+  // state: off | connecting | connected | error
+  const dot = document.getElementById("sync-status-dot");
+  if(dot) dot.className = "sync-dot " + state;
+}
+function showSyncErrorOnce(message){
+  if(syncErrorShown) return;
+  syncErrorShown = true;
+  console.warn(message);
+}
+function formatUpdatedAt(ts){
+  if(!ts || !ts.toDate) return "just now";
+  return ts.toDate().toLocaleTimeString();
+}
+
+async function connectCloudSync(){
+  setSyncDot("connecting");
+  syncStatus("Sync: connecting…");
+  try{
+    firebaseApp = initializeApp(FIREBASE_CONFIG);
+    firebaseDb  = getFirestore(firebaseApp);
+    trackerRef  = doc(firebaseDb, FIREBASE_COLLECTION, WORKFOCUS_DOC_ID);
+
+    // Initial fetch — adopt remote if it exists, otherwise seed it with local.
+    const snap = await getDoc(trackerRef);
+    if(snap.exists()){
+      const remotePayload = snap.data()?.payload;
+      if(remotePayload && typeof remotePayload === "object"){
+        applyingRemote = true;
+        data = mergeWithDefaults(remotePayload);
+        applyingRemote = false;
+        // Persist the adopted state locally so it survives the next reload.
+        try{ localStorage.setItem(STORAGE_KEY, JSON.stringify(data)); }catch(_){}
+        startTickIfRunning();
+        if(typeof renderAll === "function") renderAll();
+      }
+      setSyncDot("connected");
+      syncStatus(`Sync: connected • last update ${formatUpdatedAt(snap.data()?.updatedAt)}`);
+    }else{
+      await setDoc(trackerRef, {
+        payload: JSON.parse(JSON.stringify(data)),
+        updatedAt: serverTimestamp(),
+        updatedBy: clientId
+      });
+      setSyncDot("connected");
+      syncStatus("Sync: connected");
+    }
+
+    // Realtime subscription
+    unsubscribeRemote = onSnapshot(
+      trackerRef,
+      docSnap => {
+        if(!docSnap.exists()) return;
+        const d = docSnap.data();
+        // Skip echoes of our own writes
+        if(d?.updatedBy === clientId){
+          setSyncDot("connected");
+          syncStatus(`Sync: connected • saved ${formatUpdatedAt(d?.updatedAt)}`);
+          return;
+        }
+        if(d?.payload && typeof d.payload === "object"){
+          applyingRemote = true;
+          data = mergeWithDefaults(d.payload);
+          applyingRemote = false;
+          try{ localStorage.setItem(STORAGE_KEY, JSON.stringify(data)); }catch(_){}
+          startTickIfRunning();
+          if(typeof renderAll === "function") renderAll();
+        }
+        setSyncDot("connected");
+        syncStatus(`Sync: connected • updated ${formatUpdatedAt(d?.updatedAt)}`);
+      },
+      err => {
+        console.error("Realtime sync failed:", err);
+        setSyncDot("error");
+        syncStatus("Sync: error (using local data)");
+        showSyncErrorOnce("Firebase sync failed; the app will keep working locally.");
+      }
+    );
+  }catch(err){
+    console.error("Firebase initialization failed:", err);
+    trackerRef = null;
+    setSyncDot("error");
+    syncStatus("Sync: failed, local-only");
+    showSyncErrorOnce("Firebase setup failed; the app is using local storage only.");
+  }
+}
+
 /* ---------- Boot ---------- */
 applyRecurrenceIfDue();
 renderAll();
 startTickIfRunning();
+connectCloudSync();
 
 // Check recurring tasks every minute in case the app is left open across 5 am.
 setInterval(()=>{
